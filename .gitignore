@@ -1,0 +1,36 @@
+﻿# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# IntelliJ
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Local service account keys â€” NEVER commit these
+*serviceAccount*.json
+*firebase-adminsdk*.json
+secrets/
+*.jks
+*.keystore
+
+# Local config
+local.properties
+config.local.properties
+
+# SQLite cache files
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
