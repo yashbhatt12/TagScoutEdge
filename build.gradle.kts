@@ -24,10 +24,18 @@ dependencies {
     implementation("ch.qos.logback:logback-classic:1.5.12")
     implementation("io.github.oshai:kotlin-logging-jvm:7.0.0")
 
+    // LLRP toolkit for talking to the FR901 reader over the LAN
+    implementation("org.llrp:ltkjava:1.0.0.7") {
+        // log4j 1.x pulls in old Sun artifacts that Oracle never released to Maven Central.
+        // None of these are needed for LLRP — exclude so dependency resolution succeeds.
+        exclude(group = "javax.jms", module = "jms")
+        exclude(group = "com.sun.jdmk", module = "jmxtools")
+        exclude(group = "com.sun.jmx", module = "jmxri")
+    }
+
     // Dependencies added in later files:
-    // LTKJava         â€” File 2 (Bluebird FR901 LLRP connection)
-    // Firebase Admin  â€” File 3 (Firestore writes)
-    // SQLite JDBC     â€” File 5 (local sold-EPC cache)
+    // Firebase Admin  — File 3 (Firestore writes)
+    // SQLite JDBC     — File 5 (local sold-EPC cache)
 
     testImplementation(kotlin("test"))
 }
