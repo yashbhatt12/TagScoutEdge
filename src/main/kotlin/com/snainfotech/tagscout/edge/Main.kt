@@ -1,9 +1,12 @@
 ﻿package com.snainfotech.tagscout.edge
 
+import ch.qos.logback.classic.Level as LogbackLevel
+import ch.qos.logback.classic.Logger as LogbackLogger
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.apache.log4j.BasicConfigurator
 import org.apache.log4j.Level
 import org.apache.log4j.Logger
+import org.slf4j.LoggerFactory
 
 private val log = KotlinLogging.logger {}
 
@@ -15,28 +18,28 @@ private const val SERVICE_ACCOUNT_PATH = "secrets/firebase-service-account.json"
 private const val COMPANY_ID = "3DikZgMvwGQZkvCkzWo0ilyht2M2"
 private const val READER_ID = "reader_main_exit"
 
+// ── Demo scenario EPCs ───────────────────────────────────────────────
+// Change EPC_SOLD to an EPC you've actually marked sold in the Android app
+// to see scenario 3 fire ALLOW. The others fire ALARM regardless of cache state.
+private const val EPC_UNKNOWN = "AAAA0000000000000000UNKN"
+private const val EPC_ENROLLED_UNSOLD = "BBBB0000000000000000UNSD"
+private const val EPC_SOLD = "CCCC0000000000000000SOLD"
+private const val EPC_SECOND_UNSOLD = "DDDD0000000000000000UNS2"
+
 /**
- * File 5c — dedup pipeline writes to Firestore.
+ * File 6c — full edge pipeline with sold-cache alarm decisions.
  *
- * Same synthetic read stream as File 4c, but each closed TagEvent is written
- * to /companies/{COMPANY_ID}/tag_events/{auto-id}. After the run, check the
- * Firestore console — you should see 5 new documents.
+ * On each deduped TagEvent, we consult the live SoldEpcCache (populated from
+ * Firestore via SoldEpcRefresher) and decide ALLOW or ALARM. All events are
+ * still written to Firestore for audit; alarm decisions are the hot path.
  */
 fun main(args: Array<String>) {
-    BasicConfigurator.configure()
-    Logger.getRootLogger().level = Level.WARN
-    // Silence gRPC/Netty internals — they log every HTTP/2 frame at DEBUG.
-    (org.slf4j.LoggerFactory.getLogger("io.grpc.netty.shaded.io.netty") as ch.qos.logback.classic.Logger).level =
-        ch.qos.logback.classic.Level.WARN
-    (org.slf4j.LoggerFactory.getLogger("io.grpc") as ch.qos.logback.classic.Logger).level =
-        ch.qos.logback.classic.Level.WARN
+    silenceVerboseLogging()
 
-    log.info { "TagScoutEdge starting - version 0.5.0 (Firestore write demo)" }
-    log.info { "Dedup window: ${DEDUP_WINDOW_MS}ms" }
-    log.info { "Target: /companies/$COMPANY_ID/tag_events/" }
+    log.info { "TagScoutEdge starting - version 0.6.0 (sold-cache + alarm decisions)" }
     log.info { "" }
 
-    // Initialise Firestore once up front — fails fast if key is missing.
+    // ── Initialise Firestore writer + sold-cache refresher ──────────
     val writer = try {
         FirestoreWriter.getInstance(SERVICE_ACCOUNT_PATH, COMPANY_ID, READER_ID)
     } catch (e: Exception) {
@@ -44,88 +47,118 @@ fun main(args: Array<String>) {
         return
     }
 
+    val cache = SoldEpcCache()
+    val refresher = SoldEpcRefresher(cache, COMPANY_ID)
+
+    // Clean shutdown on Ctrl+C (irrelevant for a 10-second demo but
+    // habit-forming for the Windows Service wrapper later).
+    Runtime.getRuntime().addShutdownHook(Thread {
+        log.info { "Shutting down..." }
+        refresher.stop()
+    })
+
+    refresher.start()  // blocks until initial cache populated
+
+    log.info { "" }
+    log.info { "═══ Cache status ═══" }
+    log.info { "  Sold EPCs in cache: ${cache.size}" }
+    log.info { "  Cache age:          ${cache.ageMillis()}ms" }
+    log.info { "═══════════════════" }
+    log.info { "" }
+
+    // ── Build the demo read stream (4 scenarios) ────────────────────
+    val reads = buildDemoReads()
+    log.info { "═══ Feeding ${reads.size} raw reads (4 jewellery scenarios) ═══" }
+
     val dedup = Deduplicator(DEDUP_WINDOW_MS)
     val closedEvents = mutableListOf<TagEvent>()
 
-    val rawReads = buildSyntheticReads()
-    log.info { "═══ Feeding ${rawReads.size} raw reads through dedup ═══" }
-
-    for (raw in rawReads) {
-        val closed = dedup.offer(raw)
-        if (closed != null) {
-            closedEvents += closed
-            logEvent(closed, closedBy = "new-window")
-        }
+    for (raw in reads) {
+        dedup.offer(raw)?.let { closedEvents += it }
     }
+    val finalNow = reads.last().readAtMillis + DEDUP_WINDOW_MS + 1
+    closedEvents += dedup.flush(finalNow)
 
-    val finalNow = rawReads.last().readAtMillis + DEDUP_WINDOW_MS + 1
-    val flushed = dedup.flush(finalNow)
-    for (event in flushed) {
-        closedEvents += event
-        logEvent(event, closedBy = "flush")
-    }
-
-    // ── Write every closed event to Firestore ─────────────────────────
+    // ── Alarm decision + Firestore write ────────────────────────────
     log.info { "" }
-    log.info { "═══ Writing ${closedEvents.size} events to Firestore ═══" }
-    var writesOk = 0
-    var writesFailed = 0
+    log.info { "═══ Processing ${closedEvents.size} TagEvents ═══" }
+    var alarms = 0
+    var allowed = 0
     for (event in closedEvents) {
+        val isSold = cache.isSold(event.epc)
+        val decision = if (isSold) "ALLOW" else "ALARM"
+        val icon = if (isSold) "✓" else "🚨"
+        if (isSold) allowed++ else alarms++
+
+        log.info {
+            "  $icon $decision  EPC=${event.epc}  ant=${event.antennaPort}  " +
+                    "rssi=${event.rssi}dBm  reads=${event.rawReadCount}"
+        }
+
+        // Write audit record to Firestore regardless of decision.
         try {
-            val docId = writer.write(event)
-            log.info { "  ✓ Wrote ${event.epc.take(12)}… ant=${event.antennaPort} → $docId" }
-            writesOk++
+            writer.write(event)
         } catch (e: Exception) {
-            log.error(e) { "  ✗ Failed to write ${event.epc.take(12)}… ant=${event.antennaPort}" }
-            writesFailed++
+            log.error { "    (Firestore write failed: ${e.message})" }
         }
     }
 
     log.info { "" }
     log.info { "═══ Summary ═══" }
-    log.info { "  Raw reads in:        ${rawReads.size}" }
+    log.info { "  Raw reads in:        ${reads.size}" }
     log.info { "  TagEvents dedup out: ${closedEvents.size}" }
-    log.info { "  Firestore writes OK: $writesOk" }
-    log.info { "  Firestore failed:    $writesFailed" }
+    log.info { "  Alarms fired:        $alarms" }
+    log.info { "  Sales allowed:       $allowed" }
+    log.info { "  Sold cache size:     ${cache.size}" }
     log.info { "═══════════════" }
-    log.info { "Done. Check Firebase Console → Firestore → companies/$COMPANY_ID/tag_events" }
+
+    refresher.stop()
+    log.info { "Done." }
 }
 
-/** Same synthetic stream as File 4c. Four scenarios producing 5 distinct TagEvents. */
-private fun buildSyntheticReads(): List<RawTagRead> {
+/**
+ * Four realistic jewellery-store scenarios.
+ *   1. Unknown tag crosses       → should ALARM (not in cache, not enrolled)
+ *   2. Enrolled but unsold       → should ALARM (theft case)
+ *   3. Enrolled and sold         → should ALLOW (legitimate sale leaving)
+ *   4. Two tags simultaneously   → one ALLOW, one ALARM
+ */
+private fun buildDemoReads(): List<RawTagRead> {
     val reads = mutableListOf<RawTagRead>()
     val t0 = 1_000_000L
 
-    val epcA = "3005FB63AC1F3681EC880468"
-    for (i in 0 until 150) {
-        reads += RawTagRead(epcA, 1, -62 + (i / 10), t0 + (i * 10L))
-    }
-
-    val epcB = "E200470A24C0601215E0A7B2"
-    val tB = t0 + 1500 + 500
-    for (i in 0 until 80) {
-        reads += RawTagRead(epcB, 1, -58 + (i / 20), tB + (i * 10L))
-    }
-
-    val tC = tB + 800 + 1000
-    for (i in 0 until 60) {
-        reads += RawTagRead(epcA, 2, -55, tC + (i * 15L))
-    }
-
-    val tD = tC + 900 + 3000
-    val epcD1 = "A0B1C2D3E4F500000011AABB"
-    val epcD2 = "A0B1C2D3E4F500000022CCDD"
+    // Scenario 1: unknown tag — 50 reads on antenna 1
     for (i in 0 until 50) {
-        reads += RawTagRead(epcD1, 1, -50, tD + (i * 12L))
-        reads += RawTagRead(epcD2, 3, -48, tD + (i * 12L))
+        reads += RawTagRead(EPC_UNKNOWN, 1, -55, t0 + i * 10L)
+    }
+
+    // Scenario 2: enrolled but unsold — 60 reads on antenna 1, 3s later
+    val t2 = t0 + 500 + 3_000
+    for (i in 0 until 60) {
+        reads += RawTagRead(EPC_ENROLLED_UNSOLD, 1, -50, t2 + i * 10L)
+    }
+
+    // Scenario 3: enrolled AND sold — 70 reads on antenna 1, 3s later
+    val t3 = t2 + 600 + 3_000
+    for (i in 0 until 70) {
+        reads += RawTagRead(EPC_SOLD, 1, -48, t3 + i * 10L)
+    }
+
+    // Scenario 4: two tags simultaneously on antennas 1 and 2, 3s later
+    val t4 = t3 + 700 + 3_000
+    for (i in 0 until 40) {
+        reads += RawTagRead(EPC_SOLD, 1, -52, t4 + i * 12L)         // sold, antenna 1 — ALLOW
+        reads += RawTagRead(EPC_SECOND_UNSOLD, 2, -49, t4 + i * 12L) // unsold, antenna 2 — ALARM
     }
 
     return reads
 }
 
-private fun logEvent(e: TagEvent, closedBy: String) {
-    log.info {
-        "  → EPC=${e.epc.take(12)}… ant=${e.antennaPort} rssi=${e.rssi}dBm " +
-                "dwell=${e.dwellMillis}ms reads=${e.rawReadCount} [$closedBy]"
-    }
+/** Silences gRPC/Netty internal DEBUG spam. */
+private fun silenceVerboseLogging() {
+    BasicConfigurator.configure()
+    Logger.getRootLogger().level = Level.WARN
+    (LoggerFactory.getLogger("io.grpc.netty.shaded.io.netty") as LogbackLogger).level = LogbackLevel.WARN
+    (LoggerFactory.getLogger("io.grpc") as LogbackLogger).level = LogbackLevel.WARN
+    (LoggerFactory.getLogger("io.netty") as LogbackLogger).level = LogbackLevel.WARN
 }
