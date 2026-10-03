@@ -4,152 +4,137 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import org.apache.log4j.BasicConfigurator
 import org.apache.log4j.Level
 import org.apache.log4j.Logger
-import org.llrp.ltk.generated.enumerations.GetReaderCapabilitiesRequestedData
-import org.llrp.ltk.generated.messages.ERROR_MESSAGE
-import org.llrp.ltk.generated.messages.GET_READER_CAPABILITIES
-import org.llrp.ltk.generated.messages.GET_READER_CAPABILITIES_RESPONSE
-import org.llrp.ltk.net.LLRPConnectionAttemptFailedException
-import org.llrp.ltk.net.LLRPConnector
-import org.llrp.ltk.net.LLRPEndpoint
-import org.llrp.ltk.types.LLRPMessage
 
 private val log = KotlinLogging.logger {}
 
-// ── Reader connection parameters ─────────────────────────────────────
-// Hardcoded for now. File 3 will move these into a config file / Firestore.
-private const val READER_IP = "192.168.1.111"
-private const val READER_PORT = 5084          // Standard LLRP port
-private const val CONNECT_TIMEOUT_MS = 10_000L
-private const val TRANSACT_TIMEOUT_MS = 10_000L
+// ── Dedup parameters ─────────────────────────────────────────────────
+private const val DEDUP_WINDOW_MS = 2_000L
 
 /**
- * Minimal LLRPEndpoint — the callback interface LTKJava uses for unsolicited
- * messages from the reader (tag reports, reader events, errors).
+ * File 4c — dedup pipeline demo with synthetic reads.
  *
- * At this stage we only ask the reader for capabilities and disconnect, so
- * nothing unsolicited should arrive. In File 3+ this becomes the entry point
- * for tag reports.
+ * Generates realistic raw reads (one tag seen hundreds of times during a
+ * ~1.5s "crossing", another distinct tag, two tags on different antennas,
+ * etc.), feeds them through the Deduplicator, and prints the collapse ratio.
+ *
+ * When the reader comes back online, main() will instead subscribe to the
+ * live LLRP stream and feed each RawTagRead through the SAME deduplicator —
+ * dedup logic stays unchanged.
  */
-private class LoggingEndpoint : LLRPEndpoint {
-    override fun messageReceived(message: LLRPMessage?) {
-        log.debug { "Unsolicited LLRP message from reader: ${message?.name}" }
-    }
-
-    override fun errorOccured(message: String?) {
-        log.error { "LLRP error from reader: $message" }
-    }
-}
-
 fun main(args: Array<String>) {
-    // Silence log4j 1.x (used internally by LTKJava). Without this, log4j
-    // dumps warnings about missing appenders. Routes everything to stderr at WARN.
     BasicConfigurator.configure()
     Logger.getRootLogger().level = Level.WARN
 
-    log.info { "TagScoutEdge starting - version 0.2.0" }
-    log.info { "JVM: ${System.getProperty("java.version")} on ${System.getProperty("os.name")}" }
-    log.info { "Target reader: $READER_IP:$READER_PORT" }
+    log.info { "TagScoutEdge starting - version 0.4.0 (dedup demo)" }
+    log.info { "Dedup window: ${DEDUP_WINDOW_MS}ms" }
+    log.info { "" }
 
-    val endpoint = LoggingEndpoint()
-    val connector = LLRPConnector(endpoint, READER_IP, READER_PORT)
+    val dedup = Deduplicator(DEDUP_WINDOW_MS)
+    val closedEvents = mutableListOf<TagEvent>()
 
-    try {
-        log.info { "Connecting (timeout ${CONNECT_TIMEOUT_MS}ms)..." }
-        connector.connect(CONNECT_TIMEOUT_MS)
-        log.info { "Connected to reader." }
+    // Build a synthetic read stream representing realistic portal scenarios.
+    val rawReads = buildSyntheticReads()
+    log.info { "═══ Feeding ${rawReads.size} raw reads through dedup ═══" }
 
-        // Build and send GET_READER_CAPABILITIES with "All" requested data.
-        val request = GET_READER_CAPABILITIES()
-        request.requestedData =
-            GetReaderCapabilitiesRequestedData(GetReaderCapabilitiesRequestedData.General_Device_Capabilities)
-
-        log.info { "Requesting reader capabilities..." }
-        val response: LLRPMessage? = connector.transact(request, TRANSACT_TIMEOUT_MS)
-
-        when (response) {
-            is GET_READER_CAPABILITIES_RESPONSE -> {
-                printCapabilities(response)
-                // Full XML dump at DEBUG level — invaluable for later tuning.
-                log.debug { "Full capability response XML:\n${response.toXMLString()}" }
-            }
-            is ERROR_MESSAGE -> {
-                log.error { "Reader returned ERROR_MESSAGE: ${response.toXMLString()}" }
-            }
-            null -> {
-                log.error { "Transaction timed out after ${TRANSACT_TIMEOUT_MS}ms" }
-            }
-            else -> {
-                log.warn { "Unexpected response type: ${response.javaClass.simpleName}" }
-                log.debug { response.toXMLString() }
-            }
-        }
-    } catch (e: LLRPConnectionAttemptFailedException) {
-        log.error { "Could not connect to $READER_IP:$READER_PORT" }
-        log.error { "LLRP connection attempt failed: ${e.message}" }
-        log.error { "Common causes:" }
-        log.error { "  - Reader is powered off" }
-        log.error { "  - Wrong IP address (currently $READER_IP)" }
-        log.error { "  - Reader is on a different subnet" }
-        log.error { "  - Windows Firewall blocking outbound LLRP (port $READER_PORT)" }
-        log.error { "  - Reader already has an LLRP client connected (only one allowed)" }
-    } catch (e: Exception) {
-        log.error(e) { "Unexpected error during reader operation" }
-    } finally {
-        try {
-            connector.disconnect()
-            log.info { "Disconnected cleanly." }
-        } catch (e: Exception) {
-            log.warn { "Error during disconnect (safe to ignore): ${e.message}" }
+    // Process every raw read in order. Any closed events are collected.
+    for (raw in rawReads) {
+        val closed = dedup.offer(raw)
+        if (closed != null) {
+            closedEvents += closed
+            logEvent(closed, closedBy = "new-window")
         }
     }
 
+    // Final flush: emit any windows still open past the final read time.
+    val finalNow = rawReads.last().readAtMillis + DEDUP_WINDOW_MS + 1
+    val flushed = dedup.flush(finalNow)
+    for (event in flushed) {
+        closedEvents += event
+        logEvent(event, closedBy = "flush")
+    }
+
+    // Summary.
+    log.info { "" }
+    log.info { "═══ Dedup summary ═══" }
+    log.info { "  Raw reads in:        ${rawReads.size}" }
+    log.info { "  TagEvents out:       ${closedEvents.size}" }
+    log.info { "  Collapse ratio:      ${rawReads.size / closedEvents.size.coerceAtLeast(1)}:1" }
+    log.info { "  Unique tag/antenna:  ${closedEvents.map { it.dedupKey }.distinct().size}" }
+    log.info { "═════════════════════" }
     log.info { "Done." }
 }
 
 /**
- * Prints key fields from the capability response. Each access is guarded
- * because fields are optional in the LLRP spec — the reader might not report
- * everything, and we want to log what we CAN see rather than crash on a null.
+ * Builds a synthetic read stream representing four realistic scenarios:
+ *   A) One tag crossing antenna 1 slowly — 150 reads over 1500ms
+ *   B) A different tag on the same antenna, 500ms later — 80 reads over 800ms
+ *   C) The SAME tag as A reappears on antenna 2 — new dedup key, 60 reads
+ *   D) Two tags simultaneously on antennas 1 and 3, 3s later — fresh windows
  */
-private fun printCapabilities(resp: GET_READER_CAPABILITIES_RESPONSE) {
-    log.info { "═══ Reader Capabilities ═══" }
+private fun buildSyntheticReads(): List<RawTagRead> {
+    val reads = mutableListOf<RawTagRead>()
+    val t0 = 1_000_000L  // arbitrary epoch base
 
-    try {
-        val general = resp.generalDeviceCapabilities
-        if (general != null) {
-            log.info { "  Device Manufacturer ID:   ${general.deviceManufacturerName?.toLong()}" }
-            log.info { "  Model Number:             ${general.modelName?.toLong()}" }
-            log.info { "  Firmware Version:         ${general.readerFirmwareVersion?.toString()}" }
-            log.info { "  Max Antennas Supported:   ${general.maxNumberOfAntennaSupported?.toInteger()}" }
-            log.info { "  Can Set Antenna Props:    ${general.canSetAntennaProperties?.toBoolean()}" }
-            log.info { "  Has UTC Clock:            ${general.hasUTCClockCapability?.toBoolean()}" }
-
-            // GPIOCapabilities has an all-caps acronym — must use explicit getter.
-            val gpio = general.getGPIOCapabilities()
-            if (gpio != null) {
-                log.info { "  GPI Port Count:           ${gpio.numGPIs?.toInteger()}" }
-                log.info { "  GPO Port Count:           ${gpio.numGPOs?.toInteger()}" }
-            } else {
-                log.info { "  GPIO Capabilities:        (not reported)" }
-            }
-        } else {
-            log.warn { "  No general device capabilities reported" }
-        }
-    } catch (e: Exception) {
-        log.warn { "  Could not read general capabilities: ${e.message}" }
+    // A) EPC_A on antenna 1, 150 reads over 1500ms, RSSI varying -62 to -45
+    val epcA = "3005FB63AC1F3681EC880468"
+    for (i in 0 until 150) {
+        reads += RawTagRead(
+            epc = epcA,
+            antennaPort = 1,
+            rssi = -62 + (i / 10),  // signal strengthens as tag approaches
+            readAtMillis = t0 + (i * 10L)  // one read per 10ms = 100 Hz
+        )
     }
 
-    try {
-        val llrpCap = resp.llrpCapabilities
-        if (llrpCap != null) {
-            log.info { "  Max ROSpecs:              ${llrpCap.maxNumROSpecs?.toLong()}" }
-            log.info { "  Max AccessSpecs:          ${llrpCap.maxNumAccessSpecs?.toLong()}" }
-            log.info { "  Can Do RF Survey:         ${llrpCap.canDoRFSurvey?.toBoolean()}" }
-            log.info { "  Supports Tag Inventory:   ${llrpCap.canDoTagInventoryStateAwareSingulation?.toBoolean()}" }
-        }
-    } catch (e: Exception) {
-        log.warn { "  Could not read LLRP capabilities: ${e.message}" }
+    // B) EPC_B on antenna 1, starts 500ms AFTER A ended (fresh window)
+    val epcB = "E200470A24C0601215E0A7B2"
+    val tB = t0 + 1500 + 500
+    for (i in 0 until 80) {
+        reads += RawTagRead(
+            epc = epcB,
+            antennaPort = 1,
+            rssi = -58 + (i / 20),
+            readAtMillis = tB + (i * 10L)
+        )
     }
 
-    log.info { "═══════════════════════════" }
+    // C) EPC_A reappears on ANTENNA 2 (different dedup key → distinct event)
+    //    1 second after B ends
+    val tC = tB + 800 + 1000
+    for (i in 0 until 60) {
+        reads += RawTagRead(
+            epc = epcA,
+            antennaPort = 2,
+            rssi = -55,
+            readAtMillis = tC + (i * 15L)
+        )
+    }
+
+    // D) 3 seconds later, two tags simultaneously on antennas 1 and 3
+    val tD = tC + 900 + 3000
+    val epcD1 = "A0B1C2D3E4F500000011AABB"
+    val epcD2 = "A0B1C2D3E4F500000022CCDD"
+    for (i in 0 until 50) {
+        reads += RawTagRead(
+            epc = epcD1,
+            antennaPort = 1,
+            rssi = -50,
+            readAtMillis = tD + (i * 12L)
+        )
+        reads += RawTagRead(
+            epc = epcD2,
+            antennaPort = 3,
+            rssi = -48,
+            readAtMillis = tD + (i * 12L)
+        )
+    }
+
+    return reads
+}
+
+private fun logEvent(e: TagEvent, closedBy: String) {
+    log.info {
+        "  → EPC=${e.epc.take(12)}… ant=${e.antennaPort} rssi=${e.rssi}dBm " +
+                "dwell=${e.dwellMillis}ms reads=${e.rawReadCount} [$closedBy]"
+    }
 }
