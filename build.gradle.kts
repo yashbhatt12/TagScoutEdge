@@ -33,9 +33,11 @@ dependencies {
         exclude(group = "com.sun.jmx", module = "jmxri")
     }
 
+    // Firebase Admin SDK for Firestore writes
+    implementation("com.google.firebase:firebase-admin:9.4.1")
+
     // Dependencies added in later files:
-    // Firebase Admin  — File 3 (Firestore writes)
-    // SQLite JDBC     — File 5 (local sold-EPC cache)
+    // SQLite JDBC     — File 6 (local sold-EPC cache)
 
     testImplementation(kotlin("test"))
 }
