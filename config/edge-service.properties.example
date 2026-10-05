@@ -1,0 +1,81 @@
+# ─────────────────────────────────────────────────────────────────────
+#  TagScoutEdge — edge service configuration
+# ─────────────────────────────────────────────────────────────────────
+#  Copy this file to  config/edge-service.properties  and edit the values.
+#  The real file is gitignored; this .example is the committed template.
+#
+#  Secrets (reader username + password) live in a SEPARATE file:
+#    secrets/reader-credentials.properties
+#  See reader-credentials.properties.example for its format.
+# ─────────────────────────────────────────────────────────────────────
+
+
+# ── RFID reader ──────────────────────────────────────────────────────
+
+# WebSocket URL for the reader's native web API.
+# Use wss:// (TLS, port 7681) in production; ws:// (plain, port 8000) only on
+# an isolated test network. The TagScoutEdge client trusts self-signed certs
+# on wss:// — safe inside the customer LAN but not over the public internet.
+reader.url = wss://192.168.1.111:7681
+
+# Logical ID for this reader. Written to every tag_events document so the
+# cloud side can distinguish readers once a customer has more than one.
+# Convention: <vendor>-<location>-<role>  e.g. fr901-main-exit, fr901-stockroom-door
+reader.id = fr901-main-exit
+
+# How often to poll the reader for new tag reads (milliseconds).
+# 200ms matches the TSC web console; lower = snappier portal response but
+# more CPU and network. Don't go below 100ms without testing.
+reader.poll.ms = 200
+
+
+# ── Firebase / Firestore ─────────────────────────────────────────────
+
+# Path to the Firebase Admin SDK service account JSON key.
+# Relative paths resolve from the working directory the service runs in.
+# Download from Firebase Console → Project Settings → Service accounts.
+firebase.service.account.path = secrets/firebase-service-account.json
+
+# Which customer's data this edge PC manages. For single-tenant setups this
+# is the Firebase user UID. All reads and writes land under
+#   /companies/{this-value}/...
+# Get it from Firebase Console → Authentication → Users column, or from the
+# Firebase user record of the account you provisioned for this customer.
+firebase.company.id = REPLACE_WITH_FIREBASE_UID
+
+
+# ── Pipeline tuning ──────────────────────────────────────────────────
+
+# Dedup window — how long after the last raw read before a tag "disappears"
+# and we emit a TagEvent for it. Standard retail portals use 2000ms.
+# Raise if tags linger near the antenna and generate false alarms every 2s.
+# Lower if you need faster portal response for fast-walking customers.
+dedup.window.ms = 2000
+
+# How often the pipeline flushes completed dedup windows into the decider
+# and Firestore. Should be <= dedup.window.ms. 1000ms gives at most 1s
+# latency between a tag leaving the field and the ALARM/ALLOW decision.
+flush.interval.ms = 1000
+
+# Full refresh of the sold-EPC cache from Firestore (milliseconds).
+# The realtime listener propagates new sales within seconds, so this is
+# a safety net rather than the primary path. 5 minutes is a sensible default;
+# raise to reduce Firestore reads if you have >10K sold items.
+sold.refresh.ms = 300000
+
+
+# ── Operations ───────────────────────────────────────────────────────
+
+# Log verbosity for the service's own logger. One of: TRACE, DEBUG, INFO, WARN, ERROR.
+# INFO is right for production — one line per ALARM/ALLOW decision and
+# periodic status.
+# DEBUG adds dedup internals and per-raw-read traces (noisy, useful for
+# bringing up a new install).
+log.level = INFO
+
+# RSSI threshold for ignoring faint reads (dBm, negative integer).
+# Reads weaker than this are discarded before dedup — useful for suppressing
+# tags that are near but not AT the portal. Set to -100 to accept everything
+# (effectively no threshold). Will need tuning per install once we know the
+# antenna geometry.
+rssi.threshold.dbm = -100

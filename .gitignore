@@ -34,3 +34,7 @@ config.local.properties
 *.db-journal
 *.db-shm
 *.db-wal
+# Config and secrets — committed as .example only
+config/edge-service.properties
+secrets/*.properties
+secrets/*.json
