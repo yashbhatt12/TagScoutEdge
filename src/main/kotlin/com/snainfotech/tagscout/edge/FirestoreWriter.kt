@@ -46,7 +46,10 @@ class FirestoreWriter private constructor(
      * @return the auto-generated document ID on success
      * @throws Exception if the write fails after Firestore's internal retries
      */
-    fun write(event: TagEvent): String {
+    fun write(event: TagEvent): String = write(event, readerId)
+
+    /** Same, for a specific reader (cloud mode runs several readers through one writer). */
+    fun write(event: TagEvent, readerId: String): String {
         val doc = mapOf(
             "epc" to event.epc,
             "antennaPort" to event.antennaPort,

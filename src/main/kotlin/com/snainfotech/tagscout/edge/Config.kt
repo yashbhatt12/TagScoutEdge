@@ -30,7 +30,13 @@ private val log = KotlinLogging.logger {}
  *     Windows service.
  */
 data class Config(
-    // Reader
+    /** "cloud" (default): readers are found and set up from the TagScout web; "local": the one reader below. */
+    val readersSource: String,
+    /** This PC's ID and display name in TagScout (default: the computer name). */
+    val edgeId: String,
+    val edgeName: String,
+
+    // Reader (local mode only; blank in cloud mode)
     val readerUrl: String,
     val readerId: String,
     val readerPollMs: Long,
@@ -56,8 +62,11 @@ data class Config(
      */
     fun describe(): String = buildString {
         appendLine("Loaded configuration:")
-        appendLine("  reader.url                      = $readerUrl")
-        appendLine("  reader.id                       = $readerId")
+        appendLine("  readers.source                  = $readersSource")
+        appendLine("  edge.id                         = $edgeId")
+        appendLine("  edge.name                       = $edgeName")
+        appendLine("  reader.url                      = ${readerUrl.ifBlank { "(cloud mode)" }}")
+        appendLine("  reader.id                       = ${readerId.ifBlank { "(cloud mode)" }}")
         appendLine("  reader.poll.ms                  = $readerPollMs")
         appendLine("  reader.username                 = $readerUsername")
         appendLine("  reader.password                 = ${"*".repeat(readerPassword.length)}")
@@ -88,9 +97,22 @@ data class Config(
             val service = readProperties(servicePath)
             val creds = readProperties(credentialsPath)
 
+            val source = (service.getProperty("readers.source")?.trim()?.lowercase()).let { if (it.isNullOrEmpty()) "cloud" else it }
+            if (source != "cloud" && source != "local") {
+                throw ConfigException("readers.source in $servicePath must be 'cloud' or 'local', got '$source'")
+            }
+            val host = computerName()
+            val edgeId = (service.getProperty("edge.id")?.trim()).let { if (it.isNullOrEmpty()) "edge-" + host.lowercase() else it }
+            if (!Regex("^[A-Za-z0-9_-]{1,100}$").matches(edgeId)) {
+                throw ConfigException("edge.id in $servicePath may only use letters, digits, - and _ (got '$edgeId')")
+            }
+
             return Config(
-                readerUrl = service.requireString("reader.url", servicePath),
-                readerId = service.requireString("reader.id", servicePath),
+                readersSource = source,
+                edgeId = edgeId,
+                edgeName = (service.getProperty("edge.name")?.trim()).let { if (it.isNullOrEmpty()) host else it },
+                readerUrl = if (source == "local") service.requireString("reader.url", servicePath) else service.getProperty("reader.url")?.trim().orEmpty(),
+                readerId = if (source == "local") service.requireString("reader.id", servicePath) else service.getProperty("reader.id")?.trim().orEmpty(),
                 readerPollMs = service.requireLong("reader.poll.ms", servicePath),
                 readerUsername = creds.requireString("reader.username", credentialsPath),
                 readerPassword = creds.requireString("reader.password", credentialsPath),
@@ -131,6 +153,13 @@ data class Config(
                     )
                 }
             }
+        }
+
+        /** This computer's name, made safe for an ID (letters, digits, -). */
+        fun computerName(): String {
+            val raw = System.getenv("COMPUTERNAME") ?: System.getenv("HOSTNAME")
+                ?: runCatching { java.net.InetAddress.getLocalHost().hostName }.getOrNull() ?: "edge"
+            return raw.replace(Regex("[^A-Za-z0-9-]"), "-").trim('-').ifEmpty { "edge" }
         }
 
         /**

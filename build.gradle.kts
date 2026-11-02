@@ -57,6 +57,16 @@ tasks.register<JavaExec>("scan") {
     mainClass.set("com.snainfotech.tagscout.edge.llrp.ScanMainKt")
 }
 
+// A practice fixed reader on this PC (LLRP, port 5084; antennas on ports 1 and 2), for trying
+// the TagScout Readers page without hardware. It doesn't read tags.
+//   .\gradlew.bat practiceReader
+tasks.register<JavaExec>("practiceReader") {
+    group = "application"
+    description = "Runs a practice LLRP reader on this PC for testing scan and set-up from the web"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.snainfotech.tagscout.edge.llrp.PracticeReaderKt")
+}
+
 kotlin {
     jvmToolchain(21)
 }

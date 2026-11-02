@@ -10,7 +10,20 @@
 # ─────────────────────────────────────────────────────────────────────
 
 
-# ── RFID reader ──────────────────────────────────────────────────────
+# ── Readers: from the TagScout web (cloud) or this file (local) ──────
+
+# cloud (default): this PC registers with TagScout, scans its network for
+#   fixed readers when you click Scan network on the web (Door → Configure
+#   readers), and reads from every reader you switch on there. reader.url and
+#   reader.id below are then ignored.
+# local: read from the single reader in reader.url (the original set-up).
+readers.source = cloud
+
+# How this PC appears in TagScout. Both default to the computer's name.
+# edge.id = edge-counter-pc
+# edge.name = Counter PC
+
+# ── RFID reader (local mode only) ──────────────────────────────────────────────────────
 
 # WebSocket URL for the reader's native web API.
 # Use wss:// (TLS, port 7681) in production; ws:// (plain, port 8000) only on

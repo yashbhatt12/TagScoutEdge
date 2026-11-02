@@ -53,6 +53,9 @@ class WebSocketReaderClient(
     private var loginLatch: CountDownLatch? = null
     private var loginResult: String? = null
 
+    /** True while the WebSocket to the reader is open. */
+    val isOpen: Boolean get() = isConnected.get()
+
     /**
      * Blocking connect + login. Returns when the reader has accepted the admin login.
      * Throws if the reader is unreachable, TLS fails, or login is rejected.

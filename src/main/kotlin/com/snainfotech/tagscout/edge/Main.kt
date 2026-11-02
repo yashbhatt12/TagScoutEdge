@@ -1,4 +1,4 @@
-﻿package com.snainfotech.tagscout.edge
+package com.snainfotech.tagscout.edge
 
 import ch.qos.logback.classic.Level as LogbackLevel
 import ch.qos.logback.classic.Logger as LogbackLogger
@@ -28,6 +28,12 @@ private val stats = PipelineStats()
  * Configuration comes from config/edge-service.properties plus
  * secrets/reader-credentials.properties. See the matching .example files
  * for format. Service runs until Ctrl+C.
+ *
+ * Two modes (readers.source):
+ *   cloud (default) — this PC registers with TagScout, scans its network for
+ *                     readers when asked from the web, and reads from every
+ *                     reader switched on there (see EdgeAgent, ReaderManager).
+ *   local           — the single reader in reader.url, as before.
  */
 fun main() {
     silenceVerboseLogging()
@@ -73,6 +79,11 @@ fun main() {
     )
     refresher.start()
     log.info { "Sold-EPC cache initialized (${soldCache.size} EPCs loaded)" }
+
+    if (config.readersSource == "cloud") {
+        runCloudMode(config, firestore, soldCache, refresher)
+        return
+    }
 
     // 3. Deduplicator — raw reads in, TagEvents out.
     val dedup = Deduplicator(windowMillis = config.dedupWindowMs)
@@ -165,12 +176,72 @@ fun main() {
 }
 
 /**
+ * Cloud mode: register this PC, follow the readers set up on the web, block
+ * until Ctrl+C.
+ */
+private fun runCloudMode(config: Config, firestore: FirestoreWriter, soldCache: SoldEpcCache, refresher: SoldEpcRefresher) {
+    val manager = ReaderManager(
+        companyId = config.firebaseCompanyId,
+        edgeId = config.edgeId,
+        username = config.readerUsername,
+        password = config.readerPassword,
+        pollMs = config.readerPollMs,
+        dedupWindowMs = config.dedupWindowMs,
+        flushIntervalMs = config.flushIntervalMs,
+        onEvent = { event, readerId -> decide(event, soldCache, firestore, readerId) },
+        onRawRead = { stats.rawReads.incrementAndGet() },
+    )
+    val agent = EdgeAgent(
+        companyId = config.firebaseCompanyId,
+        edgeId = config.edgeId,
+        edgeName = config.edgeName,
+        knownReaderHosts = { manager.knownHosts() },
+    )
+
+    val statusReporter = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "status-reporter").apply { isDaemon = true }
+    }
+    statusReporter.scheduleAtFixedRate(
+        { log.info { "readers=${manager.running}  " + stats.summary(soldCacheSize = soldCache.size, soldCacheAgeMs = soldCache.ageMillis()) } },
+        30, 30, TimeUnit.SECONDS
+    )
+
+    Runtime.getRuntime().addShutdownHook(Thread {
+        log.info { "═══ SHUTDOWN ═══" }
+        try { statusReporter.shutdown() } catch (_: Exception) {}
+        try { manager.stop() } catch (_: Exception) {}
+        try { agent.stop() } catch (_: Exception) {}
+        try { refresher.stop() } catch (_: Exception) {}
+        log.info { stats.finalSummary() }
+    })
+
+    try {
+        agent.start()
+        manager.start()
+        log.info { "" }
+        log.info { "═══════════════════════════════════════════════" }
+        log.info { "  EDGE SERVICE RUNNING (cloud mode) as '${config.edgeName}'" }
+        log.info { "  Set up readers in TagScout: Door → Configure readers" }
+        log.info { "  Ctrl+C to stop" }
+        log.info { "═══════════════════════════════════════════════" }
+        log.info { "" }
+        Thread.currentThread().join()
+    } catch (e: InterruptedException) {
+        log.info { "Main thread interrupted — shutting down" }
+    } catch (e: Exception) {
+        log.error(e) { "Fatal error — service exiting" }
+    }
+}
+
+/**
  * Decision: look up EPC in the sold cache, log loudly, write audit.
+ * [readerId] = the reader it came from (cloud mode); null = the configured one (local mode).
  */
 private fun decide(
     event: TagEvent,
     soldCache: SoldEpcCache,
-    firestore: FirestoreWriter
+    firestore: FirestoreWriter,
+    readerId: String? = null
 ) {
     val isSold = soldCache.isSold(event.epc)
     val decision = if (isSold) "✓ ALLOW" else "🚨 ALARM"
@@ -178,12 +249,12 @@ private fun decide(
     stats.tagEvents.incrementAndGet()
 
     log.info {
-        "$decision  epc=${event.epc}  ant=${event.antennaPort}  " +
+        "$decision  ${readerId?.let { "reader=$it  " } ?: ""}epc=${event.epc}  ant=${event.antennaPort}  " +
                 "rssi=${event.rssi}dBm  dwell=${event.dwellMillis}ms  reads=${event.rawReadCount}"
     }
 
     try {
-        firestore.write(event)
+        if (readerId != null) firestore.write(event, readerId) else firestore.write(event)
     } catch (e: Exception) {
         log.warn { "Firestore write failed for epc=${event.epc}: ${e.message}" }
     }
