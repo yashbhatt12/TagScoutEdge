@@ -47,6 +47,16 @@ tasks.test {
     useJUnitPlatform()
 }
 
+// Find LLRP readers on this PC's network and list their antennas (read-only).
+//   .\gradlew.bat scan                          scan the local subnet(s)
+//   .\gradlew.bat scan --args="192.168.1.111"    probe specific reader(s)
+tasks.register<JavaExec>("scan") {
+    group = "application"
+    description = "Finds fixed RFID readers (LLRP, port 5084) on the network and lists their antennas"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.snainfotech.tagscout.edge.llrp.ScanMainKt")
+}
+
 kotlin {
     jvmToolchain(21)
 }
